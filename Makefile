@@ -83,7 +83,7 @@ $(BUILD)/initramfs.o: $(BUILD)/root.cpio
 usr/console.txt:
 	printf "lnxrm console\n" > $@
 usr/motd.txt:
-	printf "\n  Welcome to lnxrm!\n  A tiny unix-like kernel in asm+C+C+++Rust.\n\n" > $@
+	printf "\n  Welcome to lnxrm!\n  A tiny unix-like kernel in ASM + C+ C++ + Rust.\n\n" > $@
 
 arch/entry64.o: arch/entry64.S | $(BUILD)
 	$(NASM) -f elf64 -F dwarf -g -o $@ $<
@@ -158,7 +158,7 @@ run:
 clean:
 	rm -rf $(BUILD) usr/console.txt usr/motd.txt
 	rm -f $(KOBJ_C) $(KOBJ_CXX) $(KOBJ_ASM)
-	rm -f arch/signal_trampoline.o
+	rm -f arch/*.o
 	rm -f usr/crt0.o usr/init.o usr/sh.o usr/hello.o usr/ulib.o
 	rm -f $(KSRC_C:.c=.d) $(KSRC_CXX:.cpp=.d)
 	rm -f kernel/rust/*.o kernel/rust/*.rmeta
