@@ -1,16 +1,10 @@
 /* Interrupt dispatch: exception reporting, IRQ routing, input queue. */
 #include <cpu.h>
+#include <apic.h>
 #include <io.h>
 #include <console.h>
 #include <sched.h>
-
-static irq_handler_t handlers[16];
-
-void irq_install(int irq, irq_handler_t h)
-{
-    handlers[irq] = h;
-    irq_unmask(irq);
-}
+#include <percpu.h>
 
 /* ---- keyboard: scancode set 1 -> ASCII ---- */
 static const char kmap[128] = {
@@ -20,6 +14,21 @@ static const char kmap[128] = {
     0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
     0, '*', 0, ' ', 0,
 };
+
+static const char kmap_shift[128] = {
+    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',
+    0, '*', 0, ' ', 0,
+};
+
+#define SC_LSHIFT   0x2A
+#define SC_RSHIFT   0x36
+#define SC_CAPSLOCK 0x3A
+
+static bool shift_pressed = false;
+static bool capslock_on = false;
 
 #define KBD_DATA 0x60
 #define KBD_STAT 0x64
@@ -34,12 +43,32 @@ void kbd_irq_handler(struct intr_frame *f)
     }
     bool release = !!(sc & 0x80);
     sc &= 0x7f;
+
+    if (sc == SC_LSHIFT || sc == SC_RSHIFT) {
+        shift_pressed = !release;
+        return;
+    }
+    if (sc == SC_CAPSLOCK) {
+        if (!release)
+            capslock_on = !capslock_on;
+        return;
+    }
     if (release || ext) {
         ext = false;
         return;
     }
-    if (sc < 128 && kmap[sc])
-        input_push(kmap[sc]);
+    if (sc < 128 && kmap[sc]) {
+        char c;
+        if (shift_pressed)
+            c = kmap_shift[sc];
+        else
+            c = kmap[sc];
+        if (capslock_on && c >= 'a' && c <= 'z')
+            c = c - 'a' + 'A';
+        else if (capslock_on && c >= 'A' && c <= 'Z')
+            c = c - 'A' + 'a';
+        input_push(c);
+    }
 }
 
 /* ---- serial COM1 receive ---- */
@@ -59,7 +88,7 @@ static volatile u32 in_r, in_w;
 void input_push(char c)
 {
     if ((in_w + 1) % INBUF_SZ == in_r)
-        return;                     /* full, drop */
+        return;
     inbuf[in_w] = c;
     __atomic_store_n(&in_w, (in_w + 1) % INBUF_SZ, __ATOMIC_SEQ_CST);
 }
@@ -91,6 +120,11 @@ void isr_common(struct intr_frame *f)
         kprintf("\n[exception] %s (%d) err=%#lx rip=%#lx rsp=%#lx cr2=%#lx\n",
                 exc_names[f->intno & 31], f->intno, f->err, f->rip, f->ussp,
                 cr2);
+        {
+            u64 gs_rd = rdmsr(0xC0000101);
+            struct cpu_info *ci = this_cpu_data();
+            kprintf("[exception] GS_MSR=%p this_cpu_data=%p\n", gs_rd, (void*)ci);
+        }
         if (current) {
             kprintf("[exception] task pid=%u name=%s cs=%#lx ss=%#lx\n",
                     current->pid, current->name, f->cs, f->usss);
@@ -106,33 +140,21 @@ void isr_common(struct intr_frame *f)
     }
 
     int irq = f->intno - 32;
-    extern void pic_send_eoi(int);
     if (current && current->pid != 0)
-        current->tf = f;        /* keep the live frame pointer fresh */
-    if (irq >= 0 && irq < 16) {
-        /* spurious IRQ7/15 check */
-        if (irq == 7 || irq == 15) {
-            u16 port = irq == 7 ? 0x20 : 0xA0;
-            u8 isr_reg;
-            outb(port, 0x0B);
-            isr_reg = inb(port);
-            if (!(isr_reg & (1 << (irq & 7)))) {
-                pic_send_eoi(irq);      /* EOI only */
-                return;
-            }
-        }
-        if (handlers[irq])
-            handlers[irq](f);
-        else
-            irq_mask(irq);
-        pic_send_eoi(irq);
+        current->tf = f;
 
-        __asm__ volatile("outb %0,$0xE9" :: "a"((char)'T'));
-#if 0
-        /* preemptive path (disabled for now -- cooperative scheduling) */
-        extern void sched_maybe_preempt(struct intr_frame *f);
-        sched_maybe_preempt(f);
-#endif
+    if (irq >= 0 && irq < 16) {
+        /* spurious IRQ7/15 check (still valid with IOAPIC) */
+        if (irq == 7 || irq == 15) {
+            if (f->intno == 0xFF)
+                return;
+        }
+        irq_handler_t h = irq_get_handler(irq);
+        if (h)
+            h(f);
+
+        /* send EOI to LAPIC */
+        apic_eoi();
     } else {
         kprintf("stray vector %d\n", f->intno);
     }

@@ -6,6 +6,7 @@
 #include <console.h>
 #include <vfs.h>
 #include <pci.h>
+#include <blk_cache.h>
 
 #define AHCI_CAP     0x00
 #define AHCI_GHC     0x04
@@ -127,7 +128,7 @@ static int port_start(volatile u8 *px)
     u32 cmd = px_read(px, P_CMD);
     px_write(px, P_CMD, cmd | CMD_SUD | CMD_POD);
     if (wait_clear((volatile u32 *)(px + P_CMD), CMD_FRE | CMD_ST, 500))
-        kprintf("[ahci] warning: FRE/ST stuck\n");
+        kprintf("\033[1;33m[ahci] warning: FRE/ST stuck\033[0m\n");
     px_write(px, P_IS, ~0u);        /* clear pending */
     cmd = px_read(px, P_CMD);
     px_write(px, P_CMD, cmd | CMD_ST | CMD_FRE);
@@ -142,14 +143,57 @@ static int port_stop(volatile u8 *px)
     return wait_clear((volatile u32 *)(px + P_CMD), CMD_FRE | CMD_ST, 500);
 }
 
-#define SLOT 0
+#define MAX_SLOTS 32  /* Maximum number of command slots */
+
+/* Find a free command slot */
+static int find_free_slot(struct ahci_disk *d)
+{
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (!(d->slot_busy & (1u << i)))
+            return i;
+    }
+    return -1;  /* No free slots */
+}
+
+/* Mark a slot as busy or free */
+static void set_slot_busy(struct ahci_disk *d, int slot, bool busy)
+{
+    if (busy)
+        d->slot_busy |= (1u << slot);
+    else
+        d->slot_busy &= ~(1u << slot);
+}
 
 static int issue(struct ahci_disk *d, u8 cmd, u64 lba, u16 count, void *buf,
                  size_t len, bool write)
 {
+    /* Validate buffer and length */
+    if (!buf || len == 0)
+        return -1;
+    
+    /* Limit transfer size to prevent overflow (max 4MiB per PRDT entry) */
+    if (len > 4 * 1024 * 1024)
+        return -1;
+    
+    /* Validate LBA and count */
+    if (lba > 0x00FFFFFFFFFFFFFFULL)  /* 48-bit LBA max */
+        return -1;
+    if (count == 0 || count > 65535)
+        return -1;
+
+    /* Find a free command slot */
+    int slot = find_free_slot(d);
+    if (slot < 0) {
+        kprintf("[ahci] no free command slots\n");
+        return -1;
+    }
+    
+    /* Mark slot as busy */
+    set_slot_busy(d, slot, true);
+
     /* one PRDT entry supports up to 4 MiB; our transfers are <= 128 KiB */
-    struct cmd_hdr *h = &d->clb[SLOT];
-    struct cmd_tbl *t = d->ctbl[SLOT];
+    struct cmd_hdr *h = &d->clb[slot];
+    struct cmd_tbl *t = d->ctbl[slot];
 
     h->opts = (5u << 0)             /* FIS length in dwords */
             | (write ? (1u << 6) : 0)   /* W: 1 = host->device (write) */
@@ -158,8 +202,10 @@ static int issue(struct ahci_disk *d, u8 cmd, u64 lba, u16 count, void *buf,
     h->prdbc = 0;
 
     u64 bpa = vmm_translate((uptr)buf);
-    if (!bpa)
+    if (!bpa) {
+        set_slot_busy(d, slot, false);
         return -1;
+    }
     t->prdt[0].dba = (u32)bpa;
     t->prdt[0].dbahi = (u32)(bpa >> 32);
     t->prdt[0]._rsv = 0;
@@ -175,14 +221,14 @@ static int issue(struct ahci_disk *d, u8 cmd, u64 lba, u16 count, void *buf,
     }
     px_write(d->px, P_IS, ~0u);
     px_write(d->px, 0x30, ~0u);                /* PxSERR: clear diagnostics */
-    px_write(d->px, P_CI, 1u << SLOT);
+    px_write(d->px, P_CI, 1u << slot);
 
     int err = -1;
     for (int spin = 0; spin < 8000000; spin++) {
         u32 is = px_read(d->px, P_IS);
         if (is & IS_TFES)
             break;
-        if (!(px_read(d->px, P_CI) & (1u << SLOT))) {
+        if (!(px_read(d->px, P_CI) & (1u << slot))) {
             err = 0;
             break;
         }
@@ -191,13 +237,17 @@ static int issue(struct ahci_disk *d, u8 cmd, u64 lba, u16 count, void *buf,
 
     u32 tfd = px_read(d->px, P_TFD);
     if (err || (tfd & 1) || (px_read(d->px, P_IS) & IS_TFES)) {
-        kprintf("[ahci] cmd=%#x failed tfd=%02x is=%08x -- recovering\n",
+        kprintf("\033[1;31m[ahci] cmd=%#x failed tfd=%02x is=%08x -- recovering\033[0m\n",
                 cmd, tfd & 0xFF, px_read(d->px, P_IS));
         px_write(d->px, 0x30, ~0u);            /* unfreeze the port */
         port_stop(d->px);
         port_start(d->px);
+        set_slot_busy(d, slot, false);
         return -1;
     }
+    
+    /* Mark slot as free after successful completion */
+    set_slot_busy(d, slot, false);
     return 0;
 }
 
@@ -215,7 +265,16 @@ static int ahci_rd(struct blkdev *bd, u64 lba, u32 cnt, void *buf)
 
 static int ahci_wr(struct blkdev *bd, u64 lba, u32 cnt, const void *buf)
 {
-    return ahci_rw(bd, lba, cnt, (void *)buf, true);
+    int ret = ahci_rw(bd, lba, cnt, (void *)buf, true);
+    if (ret != 0)
+        return ret;
+
+    /* Write barrier: issue a dummy read to ensure data is flushed to disk.
+     * This prevents the issue where reading back immediately after writing
+     * returns stale data due to insufficient command queuing delays. */
+    u8 dummy[512];
+    ret = ahci_rw(bd, lba, 1, dummy, false);
+    return ret;
 }
 
 extern long console_write(struct file *, const void *, size_t);
@@ -288,19 +347,27 @@ int ahci_probe_fn(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor,
         memset(d->clb, 0, PAGE_SIZE);
         d->fb = kmalloc(PAGE_SIZE);
         memset(d->fb, 0, PAGE_SIZE);
-        d->ctbl = kmalloc(sizeof(void *));
-        d->ctbl[0] = kmalloc(PAGE_SIZE);
-        memset(d->ctbl[0], 0, PAGE_SIZE);
+        
+        /* Allocate command tables for all slots */
+        d->ctbl = kmalloc(MAX_SLOTS * sizeof(void *));
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            d->ctbl[i] = kmalloc(PAGE_SIZE);
+            memset(d->ctbl[i], 0, PAGE_SIZE);
+        }
 
         u64 clb_pa = VIRT_TO_PHYS((uptr)d->clb);
         u64 fb_pa = VIRT_TO_PHYS((uptr)d->fb);
-        u64 ct_pa = VIRT_TO_PHYS((uptr)d->ctbl[0]);
         px_write(px, P_CLB, (u32)clb_pa);
         px_write(px, P_CLBU, (u32)(clb_pa >> 32));
         px_write(px, P_FB, (u32)fb_pa);
         px_write(px, P_FBU, (u32)(fb_pa >> 32));
-        d->clb[SLOT].ctba = ct_pa;
-        d->clb[SLOT].prdtlen = 1;
+        
+        /* Initialize command headers for all slots */
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            u64 ct_pa = VIRT_TO_PHYS((uptr)d->ctbl[i]);
+            d->clb[i].ctba = ct_pa;
+            d->clb[i].prdtlen = 1;
+        }
 
         port_start(px);
 
@@ -308,7 +375,7 @@ int ahci_probe_fn(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor,
         u16 ident[256];
         memset(ident, 0xCC, sizeof(ident));
         if (issue(d, 0xEC, 0, 0, ident, 512, false)) {
-            kprintf("[ahci] identify failed on port %d\n", p);
+            kprintf("\033[1;31m[ahci] identify failed on port %d\033[0m\n", p);
             continue;
         }
         {
@@ -316,7 +383,7 @@ int ahci_probe_fn(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor,
             volatile u16 *alias = (volatile u16 *)PHYS_TO_VIRT(chk);
             kprintf("[ahci] ident[0..3]=%04x %04x %04x %04x | phys[%04x %04x] prdbc=%u\n",
                     ident[0], ident[1], ident[2], ident[3],
-                    alias[0], alias[1], d->clb[SLOT].prdbc);
+                    alias[0], alias[1], d->clb[0].prdbc);
         }
         kprintf("[ahci] serr=%08x tfd=%02x\n", px_read(px, 0x30),
                 px_read(px, P_TFD) & 0xFF);
@@ -347,5 +414,7 @@ int ahci_probe_fn(void *ctx, u8 bus, u8 dev, u8 fn, u16 vendor,
 
 void ahci_init(void)
 {
+    /* Initialize block cache before scanning for devices */
+    blk_cache_init();
     pci_scan(ahci_probe_fn, NULL);
 }

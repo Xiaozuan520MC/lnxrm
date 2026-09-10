@@ -20,14 +20,6 @@ int main(int argc, char **argv)
         kdup2(0, 2);
     }
 
-    int fd = kopen("/etc/motd", 0);
-    if (fd >= 0) {
-        long n = kread(fd, buf, sizeof(buf));
-        if (n > 0)
-            kwrite(1, buf, n);
-        kclose(fd);
-    }
-
     /* disk smoke test through AHCI+FAT32 */
     int dfd = kopen("/mnt/README.TXT", 0);
     if (dfd >= 0) {

@@ -5,7 +5,7 @@
 #include <mm.h>
 #include <vfs.h>
 #include <cpu.h>
-
+#include <signal.h>
 
 int copy_from_user(void *, const void *, size_t);
 int copy_to_user(void *, const void *, size_t);
@@ -40,13 +40,104 @@ static long sys_brk(u64 newbrk)
     return (long)current->brk_cur;
 }
 
+/* ---- kill(pid, sig) ---- */
+static long sys_kill(int pid, int sig)
+{
+    if (sig < 0 || sig >= NR_SIGNALS)
+        return -22;  /* EINVAL */
+
+    if (pid > 0) {
+        /* send to specific process */
+        struct task *t = find_task(pid);
+        if (!t)
+            return -3;  /* ESRCH */
+        send_signal(t, sig);
+        return 0;
+    } else if (pid == -1) {
+        /* send to all processes (except idle) */
+        int i = 0;
+        for (struct task *t = task_iter(&i); t; t = task_iter(&i)) {
+            if (t->pid > 0)
+                send_signal(t, sig);
+        }
+        return 0;
+    }
+    return -22;
+}
+
+/* ---- sigaction(sig, act, oldact) ---- */
+static long sys_sigaction(int sig, const struct lnxrm_sigaction *uact,
+                          struct lnxrm_sigaction *uoldact)
+{
+    if (sig < 1 || sig >= NR_SIGNALS)
+        return -22;
+
+    /* save old handler */
+    if (uoldact && user_ptr_ok((u64)uoldact, sizeof(*uoldact))) {
+        struct lnxrm_sigaction old;
+        old.sa_handler = current->sa[sig].sa_handler;
+        old.sa_mask = current->sa[sig].sa_mask;
+        old.sa_flags = current->sa[sig].sa_flags;
+        copy_to_user(uoldact, &old, sizeof(old));
+    }
+
+    /* set new handler */
+    if (uact && user_ptr_ok((u64)uact, sizeof(*uact))) {
+        struct lnxrm_sigaction act;
+        copy_from_user(&act, uact, sizeof(act));
+        current->sa[sig].sa_handler = act.sa_handler;
+        current->sa[sig].sa_mask = act.sa_mask;
+        current->sa[sig].sa_flags = act.sa_flags;
+    }
+
+    return 0;
+}
+
+/* ---- sigprocmask(how, set, oldset) ---- */
+static long sys_sigprocmask(int how, const u64 *uset, u64 *uoldset)
+{
+    u64 old_mask = current->signal_mask;
+
+    if (uoldset && user_ptr_ok((u64)uoldset, sizeof(u64)))
+        copy_to_user(uoldset, &old_mask, sizeof(u64));
+
+    if (uset && user_ptr_ok((u64)uset, sizeof(u64))) {
+        u64 new_set;
+        copy_from_user(&new_set, uset, sizeof(u64));
+
+        switch (how) {
+        case 0: /* SIG_BLOCK */
+            current->signal_mask |= new_set;
+            break;
+        case 1: /* SIG_UNBLOCK */
+            current->signal_mask &= ~new_set;
+            break;
+        case 2: /* SIG_SETMASK */
+            current->signal_mask = new_set;
+            break;
+        default:
+            return -22;
+        }
+        /* cannot block SIGKILL or SIGSTOP */
+        current->signal_mask &= ~((1ULL << SIGKILL) | (1ULL << SIGSTOP));
+    }
+
+    return 0;
+}
+
+/* ---- getcpu() ---- */
+static long sys_getcpu(void)
+{
+    return this_cpu_data()->id;
+}
+
 void syscall_entry(struct intr_frame *f)
 {
     if (current)
-        current->tf = f;        /* fork/exec need the live user frame */
+        current->tf = f;
     u64 nr = f->rax;
-    long ret = -38;                 /* ENOSYS */
-    u64 a3 = f->r10;                /* 3rd arg rides R10 (Linux-style) */
+    long ret = -38;
+    u64 a3 = f->r10;
 
     switch (nr) {
     case SYS_read:
@@ -56,7 +147,6 @@ void syscall_entry(struct intr_frame *f)
         ret = sys_write((int)f->rdi, (const void *)f->rsi, a3);
         break;
     case SYS_open: {
-        /* path lives in user memory: validate then copy */
         char path[128];
         if (user_ptr_ok(f->rdi, 2)) {
             strncpy(path, (const char *)f->rdi, 127);
@@ -89,16 +179,10 @@ void syscall_entry(struct intr_frame *f)
                          (char *const *)a3);
         break;
     case SYS_exit:
-    case SYS_wait4 + 1000:          /* unreachable, silences enum warnings */
         sys_exit((int)f->rdi);
         break;
     case SYS_getpid:
         ret = current->pid;
-        {
-            static int jd;
-            if (jd++ < 6)
-                kprintf("<j%lu>", jiffies);
-        }
         break;
     case SYS_getppid:
         ret = current->parent ? current->parent->pid : 0;
@@ -125,10 +209,28 @@ void syscall_entry(struct intr_frame *f)
         ret = 0;
         break;
     }
+    /* signal syscalls */
+    case SYS_kill:
+        ret = sys_kill((int)f->rdi, (int)f->rsi);
+        break;
+    case SYS_sigaction:
+        ret = sys_sigaction((int)f->rdi, (const struct lnxrm_sigaction *)f->rsi,
+                            (struct lnxrm_sigaction *)a3);
+        break;
+    case SYS_sigprocmask:
+        ret = sys_sigprocmask((int)f->rdi, (const u64 *)f->rsi, (u64 *)a3);
+        break;
+    case SYS_sigreturn:
+        ret = sys_sigreturn();
+        break;
+    /* SMP syscalls */
+    case SYS_getcpu:
+        ret = sys_getcpu();
+        break;
     default:
         kprintf("[sys] unknown syscall %d from pid %u\n", nr, current->pid);
         ret = -38;
     }
     f->rax = (u64)(long)ret;
-    f->rflags |= 0x200;             /* userland always runs with IF=1 */
+    f->rflags |= 0x200;
 }

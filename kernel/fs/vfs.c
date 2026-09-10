@@ -7,6 +7,7 @@
 #include <io.h>
 #include <syscall.h>
 #include <cpu.h>
+#include <blk_cache.h>
 
 /* ---- ramfs backend (fs/ramfs.c) ---- */
 extern struct fs_ops ramfs_ops;
@@ -181,6 +182,8 @@ long sys_read(int fd, void *ubuf, size_t n)
     struct file *f = fd_get(fd);
     if (!f)
         return -9;
+    if (f->is_dir)
+        return -1;
     static char kbuf[4096];
     if (n > sizeof(kbuf))
         n = sizeof(kbuf);
@@ -278,6 +281,8 @@ static long dir_getdent(struct file *f, void *buf, size_t n)
 int fat_dir_iter(struct dir_iter *it, struct dirent_out *d);
 
 static int noop_close(struct file *f) { return 0; }
+static long noop_read(struct file *f, void *buf, size_t n) { (void)f; (void)buf; (void)n; return -1; }
+static long noop_write(struct file *f, const void *buf, size_t n) { (void)f; (void)buf; (void)n; return -1; }
 
 static int dir_close(struct file *f)
 {
@@ -300,6 +305,8 @@ struct file_ops reg_fops = {
 };
 
 struct file_ops dir_fops = {
+    .read = noop_read,
+    .write = noop_write,
     .getdent = dir_getdent,
     .close = dir_close,
 };
@@ -319,9 +326,9 @@ long console_read(struct file *f, void *buf, size_t n)
             if (c == '\n')
                 break;
         } else {
-            /* IF=0 inside int 0x80 syscall, so keyboard IRQ1 cannot fire.
-             * Temporarily enable interrupts so kbd_irq_handler can push
-             * characters into the input buffer. */
+            /* We are inside int 0x80 (IF=0). Briefly enable interrupts
+             * so serial/keyboard IRQs can fire and push chars into inbuf.
+             * Without this, characters can never arrive. */
             __asm__ volatile("sti\n\tpause\n\tcli");
         }
     }
@@ -341,6 +348,7 @@ void vfs_init(void)
 {
     extern void ramfs_init(void);
     ramfs_init();
+    blk_cache_init();
 }
 
 void ramfs_add_from_cpio(const void *cpio, size_t len);
@@ -368,9 +376,16 @@ int vfs_try_mount_disk(void)
     extern struct blkdev *blk_first;
     if (!blk_first)
         return -1;
+    
+    /* Flush cache before mounting to ensure consistent state */
+    blk_cache_flush(blk_first);
+    
     void *m = fat_mount(blk_first);
     if (!m)
         return -1;
     disk_ready = true;
+    
+    /* Flush cache after mounting */
+    blk_cache_flush(blk_first);
     return 0;
 }

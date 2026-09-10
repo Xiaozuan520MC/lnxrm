@@ -8,6 +8,9 @@
 #include <ahci.h>
 #include <syscall.h>
 #include <io.h>
+#include <apic.h>
+#include <percpu.h>
+#include <smp.h>
 
 struct boot_info bootinfo;
 
@@ -69,25 +72,36 @@ void start_kernel(struct boot_params *bp)
     kprintf("\nlnxrm v1.0 -- x86_64, built %s %s\n", __DATE__,
             __TIME__);
     kprintf("[boot] %d usable e820 entries\n", bootinfo.map_len);
+
+    /* init per-cpu data for BSP (cpu 0) */
+    cpu_init_percpu(0, 0);
+
     pmm_init();
-    vmm_init();                     /* switches CR3 to master tables */
+    vmm_init();
     kheap_init();
     cpu_init();
     pit_init(HZ);
 
-    /* Make sure PS/2 keyboard IRQ1 is enabled in the 8042 controller */
-    while (inb(0x64) & 1) inb(0x60);   /* flush output buffer */
-    outb(0x64, 0x20);                   /* read command byte */
-    while (!(inb(0x64) & 1));           /* wait for data ready */
+    /* PS/2 keyboard IRQ1 setup */
+    while (inb(0x64) & 1) inb(0x60);
+    outb(0x64, 0x20);
+    while (!(inb(0x64) & 1));
     u8 cmd = inb(0x60);
-    cmd |= 0x01;                        /* enable IRQ1 */
-    outb(0x64, 0x60);                   /* write command byte */
-    while (inb(0x64) & 2);              /* wait for input buffer empty */
+    cmd |= 0x01;
+    outb(0x64, 0x60);
+    while (inb(0x64) & 2);
     outb(0x60, cmd);
 
-    irq_install(1, kbd_irq_handler);        /* PS/2 keyboard */
+    /* route PS/2 keyboard through IOAPIC (IRQ1 = vector 33) */
+    ioapic_set_irq(1, 33, 0);
+    ioapic_unmask_irq(1);
+    irq_install(1, kbd_irq_handler);
+
+    /* route COM1 serial through IOAPIC (IRQ4 = vector 36) */
     extern void serial_rx_handler(struct intr_frame *);
-    irq_install(4, serial_rx_handler);      /* COM1 */
+    ioapic_set_irq(4, 36, 0);
+    ioapic_unmask_irq(4);
+    irq_install(4, serial_rx_handler);
     extern int lnxrm_uart_irq_enable(void);
     lnxrm_uart_irq_enable();
 
@@ -99,7 +113,7 @@ void start_kernel(struct boot_params *bp)
     if (vfs_try_mount_disk() == 0)
         kprintf("[vfs] FAT32 disk mounted at /mnt\n");
     else
-        kprintf("[vfs] no disk found, running from initramfs only\n");
+        kprintf("\033[1;33m[vfs] no disk found, running from initramfs only\033[0m\n");
 
     do_global_ctors();
 
@@ -109,6 +123,9 @@ void start_kernel(struct boot_params *bp)
         extern void pid_canary_sync(void);
         pid_canary_sync();
     }
+
+    /* ---- start SMP: launch Application Processors ---- */
+    smp_init();
 
     /* hand control to the first user process */
     __asm__ volatile("sti");

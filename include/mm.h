@@ -42,11 +42,17 @@ int dup_user_aspace(u64 src, u64 dst);
 #define PG_P   0x001
 #define PG_W   0x002
 #define PG_U   0x004
+#define PG_PWT 0x008
+#define PG_PCD 0x010
 #define PG_PS  0x080
 
 /* remote PTE editing via the fixmap slot: used to touch other ASes */
 #define FIXMAP_VA      0xffffffff8e000000UL
 void fixmap_map(u64 pa);
+
+/* kernel-only MMIO mapping into DEV_VMA window (slot 98, 2 MiB).
+ * Maps one 4 KiB page: DEV_VMA + offset → phys. */
+void vmm_map_kernel_page(u64 va, u64 pa, u64 flags);
 
 
 #ifdef __cplusplus

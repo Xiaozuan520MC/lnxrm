@@ -4,6 +4,8 @@
 #include <vfs.h>
 #include <console.h>
 #include <mm.h>
+#include <blk_cache.h>
+#include <fat32_journal.h>
 
 void *fat_priv;                     /* active mount or NULL */
 extern struct fs_ops fat32_ops;     /* defined at the bottom of this file */
@@ -55,12 +57,14 @@ struct fat_dirent {
 
 static int rd_sec(struct fat_mount *m, u64 lba, void *buf)
 {
-    return m->dev->read(m->dev, lba, 1, buf);
+    /* Use block cache for better performance */
+    return blk_cache_read(m->dev, lba, buf);
 }
 
 static int wr_sec(struct fat_mount *m, u64 lba, const void *buf)
 {
-    return m->dev->write(m->dev, lba, 1, buf);
+    /* Use block cache for better performance */
+    return blk_cache_write(m->dev, lba, buf);
 }
 
 static u32 fat_next(struct fat_mount *m, u32 clus)
@@ -355,12 +359,21 @@ static int fat_read(void *mnt, void *node, u64 off, void *ubuf, size_t n)
     struct resolve *r = node;
     if (r->de.attr & ATTR_DIR)
         return -1;
+    
+    /* Validate buffer pointer */
+    if (!ubuf && n > 0)
+        return -1;
+    
     u32 clus = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
     u64 size = r->de.filesize;
     if (off >= size)
         return 0;
     if (off + n > size)
         n = size - off;
+
+    /* Limit read size to prevent buffer overflow */
+    if (n > 1024 * 1024)  /* Max 1MB per read */
+        n = 1024 * 1024;
 
     u8 tmp[512];
     u64 done = 0;
@@ -373,6 +386,11 @@ static int fat_read(void *mnt, void *node, u64 off, void *ubuf, size_t n)
     u32 in_clus = skip % m->cluster_size;
     while (done < n && !clus_is_eoc(clus) && clus >= 2) {
         u64 chunk = MIN(n - done, m->cluster_size - in_clus);
+        
+        /* Ensure chunk doesn't exceed sector size for safety */
+        if (chunk > m->bytes_per_sector)
+            chunk = m->bytes_per_sector;
+        
         m->dev->read(m->dev,
                      clus_lba(m, clus) + in_clus / m->bytes_per_sector,
                      (chunk + m->bytes_per_sector - 1) / m->bytes_per_sector,
@@ -436,12 +454,25 @@ static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
         r->de.filesize = 0;
         return 0;
     }
+    
+    /* Validate buffer pointer */
+    if (!buf && n > 0)
+        return -1;
+    
+    /* Limit write size to prevent buffer overflow */
+    if (n > 1024 * 1024)  /* Max 1MB per write */
+        n = 1024 * 1024;
+
+    /* Start a transaction for atomic updates */
+    fat32_journal_begin();
 
     u32 clus = ((u32)r->de.fstclushi << 16) | r->de.fstcluslo;
     u64 need = MAX(off + n, r->de.filesize);
     clus = alloc_chain(m, clus, need);
-    if (!clus)
+    if (!clus) {
+        fat32_journal_abort();
         return -5;
+    }
     r->de.fstclushi = clus >> 16;
     r->de.fstcluslo = clus & 0xFFFF;
 
@@ -460,7 +491,11 @@ static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
         u64 chunk = MIN(n - done, m->bytes_per_sector - sec_off);
         rd_sec(m, lba, tmp);
         memcpy(tmp + sec_off, (const u8 *)buf + done, chunk);
+        
+        /* Add to journal before writing */
+        fat32_journal_add(lba, tmp);
         wr_sec(m, lba, tmp);
+        
         done += chunk;
         in_clus += chunk;
         if (in_clus >= m->cluster_size) {
@@ -491,12 +526,21 @@ static int fat_write(void *mnt, void *node, u64 off, const void *buf, size_t n)
                     e->fstclushi = r->de.fstclushi;
                     e->fstcluslo = r->de.fstcluslo;
                     e->attr |= ATTR_ARCHIVE;
+                    
+                    /* Add to journal before writing */
+                    fat32_journal_add(lba, dbuf);
                     wr_sec(m, lba, dbuf);
+                    
+                    /* Commit the transaction */
+                    fat32_journal_commit();
                     return done;
                 }
             }
         }
     }
+    
+    /* Commit the transaction */
+    fat32_journal_commit();
     return done;
 }
 
@@ -573,6 +617,10 @@ static int fat_unlink(void *mnt, const char *path)
         return -2;
     if (r.de.attr & ATTR_DIR)
         return -1;
+    
+    /* Start a transaction for atomic updates */
+    fat32_journal_begin();
+    
     u32 clus = ((u32)r.de.fstclushi << 16) | r.de.fstcluslo;
     while (!clus_is_eoc(clus) && clus >= 2) {
         u32 nx = fat_next(m, clus);
@@ -588,16 +636,25 @@ static int fat_unlink(void *mnt, const char *path)
             for (u32 doff = 0; doff <= m->bytes_per_sector - DIRENT_SIZE;
                  doff += DIRENT_SIZE) {
                 struct fat_dirent *e = (struct fat_dirent *)(buf + doff);
-                if (e->name[0] == ENT_END)
+                if (e->name[0] == ENT_END) {
+                    fat32_journal_abort();
                     return -2;
+                }
                 if (ent_used(e) && !memcmp(e->name, r.de.name, 11)) {
                     e->name[0] = ENT_E5;
+                    
+                    /* Add to journal before writing */
+                    fat32_journal_add(lba, buf);
                     wr_sec(m, lba, buf);
+                    
+                    /* Commit the transaction */
+                    fat32_journal_commit();
                     return 0;
                 }
             }
         }
     }
+    fat32_journal_abort();
     return -2;
 }
 
@@ -733,6 +790,9 @@ void *fat_mount(struct blkdev *dev)
         kprintf("[fatprobe] lba0 rc=%d w=%08x | lba%lu rc=%d w=%08x\n",
                 rc1, w0, data_start, rc2, w2);
     }
+
+    /* Initialize journal for transaction support */
+    fat32_journal_init(dev);
 
     fat_priv = m;
     return m;

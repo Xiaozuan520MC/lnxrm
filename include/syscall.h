@@ -2,7 +2,6 @@
 #include <types.h>
 #include <sched.h>
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,7 +12,7 @@ extern "C" {
 #define SYS_open        2
 #define SYS_close       3
 #define SYS_lseek       8
-#define SYS_getdent     17      /* eck: read dirents */
+#define SYS_getdent     17
 #define SYS_dup2        33
 #define SYS_brk         12
 #define SYS_fork        57
@@ -24,7 +23,14 @@ extern "C" {
 #define SYS_getppid     110
 #define SYS_nanosleep   35
 #define SYS_uname       63
-#define SYS_ps          200     /* eck debug: task table */
+#define SYS_ps          200
+/* signal syscalls */
+#define SYS_kill        62
+#define SYS_sigaction   64
+#define SYS_sigprocmask 65
+#define SYS_sigreturn   201
+/* SMP syscalls */
+#define SYS_getcpu      202
 
 struct lnxrm_utsname {
     char sysname[24];
@@ -36,15 +42,21 @@ struct lnxrm_utsname {
 
 struct lnxrm_dirent {
     u64 d_ino;
-    u8  d_type;                 /* 4=dir, 8=reg, 3=chr */
-    char d_name[56];            /* NUL-terminated */
+    u8  d_type;
+    char d_name[56];
+};
+
+/* sigaction for userspace (matches kernel struct sigaction) */
+struct lnxrm_sigaction {
+    void (*sa_handler)(int);
+    u64 sa_mask;
+    int sa_flags;
 };
 
 void syscall_entry(struct intr_frame *f);
 long sys_open(const char *path, int flags);
 long sys_read(int fd, void *buf, size_t n);
 long sys_write(int fd, const void *buf, size_t n);
-
 
 #ifdef __cplusplus
 }

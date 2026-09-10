@@ -1,6 +1,7 @@
 #pragma once
 #include <types.h>
-
+#include <spinlock.h>
+#include <signal.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,12 +31,14 @@ enum task_state {
     T_RUNNING,
     T_SLEEPING,
     T_ZOMBIE,
+    T_STOPPED,
 };
 
 #define TASK_NAME_LEN 16
 
 struct task {
     u32 pid;
+    u32 cpu_id;                     /* CPU running this task (-1 if none) */
     enum task_state state;
     char name[TASK_NAME_LEN];
 
@@ -57,9 +60,20 @@ struct task {
     struct task *parent;
     struct task *next;              /* all-tasks list */
     struct task *rq_next;           /* runqueue link */
+
+    /* signal support */
+    u64 signal_pending;             /* bitmask of pending signals */
+    u64 signal_mask;                /* bitmask of blocked signals */
+    struct sigaction sa[NR_SIGNALS]; /* per-signal handlers */
 };
 
+#ifdef CONFIG_SMP
+#include <percpu.h>
+struct task *get_current(void);
+#define current (get_current())
+#else
 extern struct task *current;
+#endif
 
 #define KSTACK_SIZE 32768
 
@@ -81,9 +95,18 @@ int copy_to_user(void *udst, const void *ksrc, size_t n);
 void sched_init(void);
 void schedule(void);
 void sched_tick(void);              /* PIT hook: quantum expiry */
+void sched_maybe_preempt(struct intr_frame *f);
 void yield(void);
 int  sys_nanosleep(u64 ms);
 struct task *task_iter(int *i);
+void task_set_cpu(struct task *t, int cpu);
+int  task_count(void);
+
+/* signal helpers (kernel/signal.c) */
+void send_signal(struct task *t, int sig);
+void do_signal_check(struct task *t);
+void signal_init_trampoline(u64 pml4);
+long sys_sigreturn(void);
 void runqueue_add(struct task *t);
 void runqueue_remove(struct task *t);
 void idle_loop(void) __attribute__((noreturn));

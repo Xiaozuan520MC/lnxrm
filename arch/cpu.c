@@ -1,9 +1,11 @@
-/* CPU bring-up: GDT/TSS, IDT, 8259 PIC, PIT timer, MSR helpers. */
+/* CPU bring-up: GDT/TSS, IDT, APIC, PIT timer, MSR helpers. */
 #include <cpu.h>
+#include <apic.h>
 #include <console.h>
 #include <mm.h>
 #include <sched.h>
 #include <io.h>
+#include <percpu.h>
 
 /* ---- selectors (keep in sync with setup.asm / entry64.S) ----
  * 0x08 kernel code, 0x10 kernel data, 0x18 user code, 0x20 user data,
@@ -42,10 +44,6 @@ void gdt_init(void)
     e[4] = 0x00CFF2000000FFFF;      /* 0x20 UDATA DPL=3 */
 
     u64 b = (uptr)&tss;
-    /* 64-bit TSS descriptor layout:
-     *   [15:0] limit        [31:16] base[15:0]   [39:32] base[23:16]
-     *   [47:40] access=0x89 [55:52] flags(G L ...)
-     *   [63:56] base[31:24]; next dword = base[63:32] */
     e[5] = ((sizeof(tss) - 1) & 0xFFFFULL)
          | ((b & 0xFFFFULL) << 16)
          | (((b >> 16) & 0xFFULL) << 32)
@@ -81,14 +79,13 @@ static struct idt_gate idt[256];
 static struct gdtr idtr;
 
 extern u64 isr_stub_table[];
-typedef int (*isr_fn)(void);
 
 static void set_gate(int v, u64 handler, u8 dpl)
 {
     idt[v].off_lo = handler & 0xffff;
     idt[v].sel = 0x08;
     idt[v].ist = 0;
-    idt[v].type = 0x8E | (dpl << 5);    /* P | DPL<<5 | type E => 0xEE for ring3 */
+    idt[v].type = 0x8E | (dpl << 5);
     idt[v].off_mid = (handler >> 16) & 0xffff;
     idt[v].off_hi = handler >> 32;
     idt[v].zero = 0;
@@ -106,43 +103,41 @@ void idt_init(void)
     __asm__ volatile("lidt %0" ::"m"(idtr));
 }
 
-/* ---- ports ---- */
-#define PIC1_CMD 0x20
-#define PIC2_CMD 0xA0
+/* ---- APIC IRQ routing (replaces 8259 PIC) ---- */
+static irq_handler_t handlers[16];
 
-static void pic_remap(void)
+void irq_install(int irq, irq_handler_t h)
 {
-    outb(PIC1_CMD, 0x11); io_wait();
-    outb(PIC2_CMD, 0x11); io_wait();
-    outb(0x21, 32); io_wait();         /* IRQ0 -> vector 32 */
-    outb(0xA1, 40); io_wait();         /* IRQ8 -> vector 40 */
-    outb(0x21, 0x04); io_wait();       /* cascade */
-    outb(0xA1, 0x02); io_wait();
-    outb(0x21, 0x01); io_wait();
-    outb(0xA1, 0x01); io_wait();
-    outb(0x21, 0xFF);                  /* mask all until drivers hook in */
-    outb(0xA1, 0xFF);
+    handlers[irq] = h;
 }
 
-void pic_send_eoi(int irq)
+irq_handler_t irq_get_handler(int irq)
 {
-    if (irq >= 8)
-        outb(PIC2_CMD, 0x20);
-    outb(PIC1_CMD, 0x20);
+    if (irq >= 0 && irq < 16)
+        return handlers[irq];
+    return NULL;
 }
 
-void irq_mask(int irq)
+void apic_irq_install(int irq, irq_handler_t h)
 {
-    u16 port = irq < 8 ? 0x21 : 0xA1;
-    u8 m = inb(port) | (1 << (irq & 7));
-    outb(port, m);
+    handlers[irq] = h;
+    ioapic_set_irq(irq, irq + 32, 0);
+    ioapic_unmask_irq(irq);
 }
 
-void irq_unmask(int irq)
+void apic_irq_unmask(u32 irq)
 {
-    u16 port = irq < 8 ? 0x21 : 0xA1;
-    u8 m = inb(port) & ~(1 << (irq & 7));
-    outb(port, m);
+    ioapic_unmask_irq(irq);
+}
+
+void apic_irq_mask(u32 irq)
+{
+    ioapic_mask_irq(irq);
+}
+
+void apic_irq_eoi(void)
+{
+    apic_eoi();
 }
 
 /* ---- PIT ---- */
@@ -156,6 +151,7 @@ static void pit_handler(struct intr_frame *f)
 {
     jiffies++;
     sched_tick();
+    sched_maybe_preempt(f);
 }
 
 void pit_init(u32 hz)
@@ -164,8 +160,9 @@ void pit_init(u32 hz)
     outb(PIT_CMD, 0x36);
     outb(PIT_CH0, div & 0xff);
     outb(PIT_CH0, (div >> 8) & 0xff);
-    irq_install(0, pit_handler);
-    irq_unmask(0);
+    /* route PIT through IOAPIC vector 32 */
+    ioapic_set_irq(0, 32, 0);
+    ioapic_unmask_irq(0);
 }
 
 /* ---- msr ---- */
@@ -191,11 +188,17 @@ u64 rdtsc(void)
 void cpu_init(void)
 {
     gdt_init();
+    /* Re-set GS base after GDT reload — gdt_reload() does mov gs,ax
+     * which in QEMU's TCG resets the hidden base from the GDT entry,
+     * clobbering the MSR we set in cpu_init_percpu(). */
+    u64 gs_val = (u64)&cpu_table[0];
+    cpu_set_gs_base(gs_val);
+    kprintf("[cpu] GS base set to %p, rdmsr reads %p\n", gs_val, rdmsr(0xC0000101));
     idt_init();
-    gdt_init();
-    idt_init();
-    pic_remap();
-    /* enable SSE so any FP codegen does not #UD (kernel itself stays integer) */
+    /* init LAPIC + IOAPIC (replaces PIC) */
+    apic_init();
+    ioapic_init();
+    /* enable SSE so any FP codegen does not #UD */
     u64 cr0, cr4;
     __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
     cr0 &= ~(1UL << 2);             /* EM=0 */

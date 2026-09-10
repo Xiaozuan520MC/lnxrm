@@ -219,6 +219,29 @@ void fixmap_map(u64 pa)
     __asm__ volatile("invlpg (%0)" ::"r"(FIXMAP_VA) : "memory");
 }
 
+/* Map a single physical page into the kernel's DEV_VMA window (slot 98).
+ * va must be in [DEV_VMA, DEV_VMA + 2 MiB).  flags: PG_PCD etc. */
+void vmm_map_kernel_page(u64 va, u64 pa, u64 flags)
+{
+    u64 *pdhi = (u64 *)PHYS_TO_VIRT(PD_HI);
+    u64 pd_idx = (va >> 21) & 511;
+
+    if (!(pdhi[pd_idx] & PG_P)) {
+        /* allocate a fresh page table for this PD slot */
+        u64 pt_pa = pmm_alloc();
+        if (!pt_pa)
+            panic("vmm: no frame for MMIO pt");
+        memset(ptable_ptr(pt_pa), 0, PAGE_SIZE);
+        pdhi[pd_idx] = pt_pa | PG_P | PG_W;
+    }
+    /* split: if it's a 2 MiB page we must not clobber it;
+     * callers only target fresh slots so this is fine. */
+    u64 *pt = ptable_ptr(pdhi[pd_idx] & ~0xfffUL);
+    u64 pt_idx = (va >> 12) & 511;
+    pt[pt_idx] = (pa & ~0xfffUL) | PG_P | PG_W | flags;
+    __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
+}
+
 /* Deep-copy the user subtree of `src` into `dst` (both PML4 phys).
  * Source pages are reachable through the CURRENT address space. */
 int dup_dbg_pages;

@@ -7,6 +7,8 @@
 #include <vfs.h>
 #include <elf.h>
 #include <cpu.h>
+#include <spinlock.h>
+#include <signal.h>
 
 
 extern void glue_first(void);
@@ -17,13 +19,13 @@ void runqueue_remove(struct task *);
 int  task_count(void);
 
 static u32 pid_counter;
+static spinlock_t pid_lock = SPINLOCK_INIT;
 
-static u32 pid_shadow = 1;   /* synced after boot spawns via pid_canary_sync */
+static u32 pid_shadow = 1;
 
 void pid_canary_sync(void)
 {
     extern u32 next_pid(void);
-    /* called once after boot-time spawns */
     pid_shadow = pid_counter;
 }
 
@@ -41,8 +43,12 @@ void pid_canary_check(void)
 
 u32 next_pid(void)
 {
-    pid_shadow = ++pid_counter;   /* legitimate bump keeps the shadow in sync */
-    return pid_counter;
+    u64 flags;
+    spin_lock_irqsave(&pid_lock, &flags);
+    u32 pid = ++pid_counter;
+    pid_shadow = pid_counter;
+    spin_unlock_irqrestore(&pid_lock, flags);
+    return pid;
 }
 
 /* ---- fd table helpers ---- */
@@ -98,7 +104,6 @@ int sys_fork(void)
     ch->state = T_EMBRYO;
     ch->pml4 = vmm_new_user_aspace();
 
-    /* duplicate user pages: walk parent's slot-255 subtree */
     extern int dup_user_aspace(u64 src, u64 dst);
     if (dup_user_aspace(current->pml4, ch->pml4) < 0) {
         vmm_destroy_user_aspace(ch->pml4);
@@ -106,6 +111,9 @@ int sys_fork(void)
         task_free_slot(ch);
         return -1;
     }
+
+    /* install signal trampoline in child */
+    signal_init_trampoline(ch->pml4);
 
     /* clone fd table */
     memcpy(ch->fds, current->fds, sizeof(ch->fds));
@@ -115,22 +123,26 @@ int sys_fork(void)
     ch->brk_base = current->brk_base;
     ch->brk_cur = current->brk_cur;
 
-    /* fabricate the child's interrupt frame at the top of its kstack */
+    /* copy signal handlers */
+    memcpy(ch->sa, current->sa, sizeof(ch->sa));
+    ch->signal_pending = 0;
+    ch->signal_mask = current->signal_mask;
+
+    /* fabricate the child's interrupt frame */
     struct intr_frame *tf =
         (struct intr_frame *)(ch->kstack_top - sizeof(struct intr_frame));
     memcpy(tf, current->tf, sizeof(*tf));
-    tf->rax = 0;                    /* child sees fork() == 0 */
-    tf->rflags |= 0x200;            /* interrupts ON in ring 3 (the copied
-                                       kernel frame had IF cleared by the
-                                       interrupt gate) */
+    tf->rax = 0;
+    tf->rflags |= 0x200;
     ch->tf = tf;
 
-    /* register save area on the child kstack, right below its frame */
+    /* register save area */
     u64 *area = (u64 *)((char *)tf - 7 * 8);
     memset(area, 0, 6 * 8);
     area[6] = (u64)glue_first;
     ch->ctx.sp = (u64)area;
 
+    ch->cpu_id = -1;
     ch->state = T_RUNNABLE;
     runqueue_add(ch);
     return ch->pid;
@@ -180,9 +192,6 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     vfs_close_file(f);
 
     u64 old_pml4 = current->pml4;
-
-    /* build the new address space and switch to it before loading:
-     * elf_load writes through user VAs, so the new AS must be active */
     u64 new_pml4 = vmm_new_user_aspace();
 
     /* map a fresh user stack (16 KiB) below USER_STACK_TOP */
@@ -200,28 +209,34 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     u64 entry = 0, brk_end = 0;
     vmm_switch_to(new_pml4);
     entry = elf_load(new_pml4, img, sz, &brk_end);
-    (void)0;
     if (!entry) {
         kfree(img);
-        sys_exit(-8);               /* AS already switched; bail hard */
+        sys_exit(-8);
     }
     kfree(img);
 
-    /* tear down the old address space (we no longer run in it) */
     vmm_destroy_user_aspace(old_pml4);
     current->pml4 = new_pml4;
     current->brk_base = (void *)ALIGN_UP(brk_end, PAGE_SIZE);
     current->brk_cur = current->brk_base;
     for (int i = 0; i < NR_FDS; i++)
         if (current->fds[i] && !(current->fds[i]->flags & 010000))
-            ;                       /* keep fds simple: inherit all */
+            ;
     strncpy(current->name, path, TASK_NAME_LEN - 1);
+
+    /* reset signal handlers to SIG_DFL on exec */
+    for (int i = 1; i < NR_SIGNALS; i++)
+        current->sa[i].sa_handler = SIG_DFL;
+    current->signal_pending = 0;
+
+    /* install signal trampoline */
+    signal_init_trampoline(new_pml4);
 
     /* user stack with argv/envp per SysV ABI */
     u64 sp = USER_STACK_TOP;
     u64 argv_ptrs[17];
     u64 envp_ptr = 0;
-    sp -= 64;                       /* env placeholder */
+    sp -= 64;
     *(u64 *)(sp) = 0;
     for (int i = argc - 1; i >= 0; i--) {
         size_t len = strlen(argv[i]) + 1;
@@ -232,9 +247,9 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     sp &= ~15UL;
     sp -= 24;
     u64 ap = sp;
-    *(u64 *)ap = 0;                 /* envp[0] = NULL */
+    *(u64 *)ap = 0;
     ap += 8;
-    *(u64 *)ap = 0;                 /* auxv terminator */
+    *(u64 *)ap = 0;
     ap += 8;
     sp -= (argc + 2) * 8;
     u64 argvp = sp;
@@ -248,10 +263,7 @@ long sys_execve(const char *upath, char *const uargv[], char *const uenvp[])
     f2->ussp = sp;
     f2->cs = 0x18 | 3;
     f2->usss = 0x20 | 3;
-    f2->rflags = 0x202;             /* IF | reserved bit 1 */
-    (void)envp_ptr;
-    (void)argvp;
-    (void)envbuf;
+    f2->rflags = 0x202;
     return 0;
 }
 
@@ -262,12 +274,15 @@ void sys_exit(int code)
         if (current->fds[i])
             sys_close(i);
 
-    /* orphan children -> reparent to init (lowest live non-idle task) */
     struct task *init_t = NULL;
     int i = 0;
     for (struct task *t = task_iter(&i); t; t = task_iter(&i))
         if (t != current && t->parent == current)
             t->parent = init_t ? init_t : find_task(1);
+
+    /* send SIGCHLD to parent */
+    if (current->parent)
+        send_signal(current->parent, SIGCHLD);
 
     current->exit_code = code;
     current->state = T_ZOMBIE;
@@ -278,8 +293,6 @@ void sys_exit(int code)
         runqueue_add(current->parent);
     }
     schedule();
-    /* Nothing else runnable: park as a zombie. The reaper does NOT free our
-     * kernel stack, so it is safe to stay resident on it. */
     for (;;)
         __asm__ volatile("hlt");
 }
@@ -301,9 +314,6 @@ int sys_waitpid(int wpid, int *ustatus, int opts)
                     copy_to_user(ustatus, &code, sizeof(code));
                 u32 pid = t->pid;
                 vmm_destroy_user_aspace(t->pml4);
-                /* Safe to free: the zombie is parked in its final hlt loop,
-                 * will never be scheduled again, and this reaper code runs
-                 * on the PARENT's stack -- the dying stack is dormant. */
                 kfree(t->kstack);
                 t->kstack = NULL;
                 task_free_slot(t);
@@ -311,10 +321,11 @@ int sys_waitpid(int wpid, int *ustatus, int opts)
             }
         }
         if (!have_kids)
-            return -10;             /* ECHILD-ish */
-        if (opts & 1)               /* WNOHANG */
+            return -10;
+        if (opts & 1)
             return 0;
         current->state = T_SLEEPING;
+        current->sleep_until = ~0ULL;
         runqueue_remove(current);
         schedule();
     }
@@ -345,7 +356,6 @@ int copy_to_user(void *udst, const void *ksrc, size_t n)
 }
 
 /* ================= first user process ================= */
-/* Build a runnable ring-3 task around `path` before any scheduler exists. */
 int kernel_spawn(const char *path)
 {
     struct task *t = task_alloc_slot();
@@ -358,6 +368,9 @@ int kernel_spawn(const char *path)
     strncpy(t->name, path, TASK_NAME_LEN - 1);
     t->state = T_EMBRYO;
     t->pml4 = vmm_new_user_aspace();
+
+    /* install signal trampoline */
+    signal_init_trampoline(t->pml4);
 
     struct file *f = NULL;
     if (vfs_open_file(path, O_RDONLY, &f) < 0) {
@@ -381,15 +394,15 @@ int kernel_spawn(const char *path)
     kfree(img);
     if (!entry)
         panic("cannot load %s", path);
-    /* argv = {"path", NULL} on the fresh stack -- child AS still active! */
+
     u64 sp = USER_STACK_TOP - 256;
     strcpy((char *)sp, path);
     u64 argp[2] = { sp, 0 };
     u64 ap = sp - 32;
-    ((u64 *)ap)[0] = 1;             /* argc */
-    ((u64 *)ap)[1] = argp[0];       /* argv[0] */
-    ((u64 *)ap)[2] = 0;             /* argv NULL */
-    ((u64 *)ap)[3] = 0;             /* envp NULL */
+    ((u64 *)ap)[0] = 1;
+    ((u64 *)ap)[1] = argp[0];
+    ((u64 *)ap)[2] = 0;
+    ((u64 *)ap)[3] = 0;
 
     vmm_switch_to(master_pml4_phys());
     t->brk_base = (void *)ALIGN_UP((uptr)t->brk_base, PAGE_SIZE);
@@ -410,6 +423,7 @@ int kernel_spawn(const char *path)
     area[6] = (u64)glue_first;
     t->ctx.sp = (u64)area;
 
+    t->cpu_id = -1;
     t->state = T_RUNNABLE;
     runqueue_add(t);
     kprintf("[task] spawned pid=%u (%s) entry=%#lx sp=%#lx\n", t->pid, path,
@@ -420,9 +434,10 @@ int kernel_spawn(const char *path)
 void ps_dump(void)
 {
     int i = 0;
-    kprintf("  PID STATE     NAME            PARENT\n");
+    kprintf("  PID CPU STATE     NAME            PARENT\n");
     for (struct task *t = task_iter(&i); t; t = task_iter(&i)) {
-        kprintf("%5u %-9s %-15s %u\n", t->pid, task_state_name(t->state),
+        kprintf("%5u %3d %-9s %-15s %u\n", t->pid, t->cpu_id,
+                task_state_name(t->state),
                 t->name, t->parent ? t->parent->pid : 0);
     }
 }

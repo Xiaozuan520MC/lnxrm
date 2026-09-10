@@ -54,6 +54,9 @@ typedef intptr_t iptr;
 
 #define NR_TASKS        64
 #define NR_FDS          16
+#define NR_SIGNALS      32
+#define MAX_CPUS        8
+#define CONFIG_SMP      1
 
 
 #ifdef __cplusplus

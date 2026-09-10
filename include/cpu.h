@@ -10,7 +10,6 @@ extern "C" {
 void cpu_init(void);
 void gdt_init(void);
 void idt_init(void);
-void pic_init(void);
 void pit_init(u32 hz);
 u64  rdmsr(u32 msr);
 void wrmsr(u32 msr, u64 v);
@@ -20,8 +19,13 @@ u64  rdtsc(void);
 typedef void (*irq_handler_t)(struct intr_frame *);
 void isr_common(struct intr_frame *f);
 void irq_install(int irq, irq_handler_t h);
-void irq_mask(int irq);
-void irq_unmask(int irq);
+irq_handler_t irq_get_handler(int irq);
+
+/* APIC IRQ routing (replaces 8259 PIC) */
+void apic_irq_unmask(u32 irq);
+void apic_irq_mask(u32 irq);
+void apic_irq_eoi(void);
+void apic_irq_install(int irq, irq_handler_t h);
 
 /* input queue (drivers/ps2kbd.c feeds it; serial too) */
 void kbd_irq_handler(struct intr_frame *f);
