@@ -227,6 +227,11 @@ void syscall_entry(struct intr_frame *f)
     case SYS_getcpu:
         ret = sys_getcpu();
         break;
+    case SYS_diskinfo: {
+        extern int blk_list_all(void *ubuf, int max);
+        ret = blk_list_all((void *)f->rdi, (int)f->rsi);
+        break;
+    }
     default:
         kprintf("[sys] unknown syscall %d from pid %u\n", nr, current->pid);
         ret = -38;

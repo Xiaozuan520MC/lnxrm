@@ -361,14 +361,36 @@ int vfs_mount_root(void)
 }
 
 struct blkdev *blk_first;
+static struct blkdev *blk_list[8];
+static int blk_count;
 
 void blk_register(struct blkdev *b)
 {
-    if (!blk_first) {
+    if (blk_count < 8)
+        blk_list[blk_count++] = b;
+    if (!blk_first)
         blk_first = b;
-        kprintf("[blk] registered %s (%u sectors)\n", b->name,
-                b->num_sectors);
+    kprintf("[blk] registered %s (%llu sectors, %llu MiB)\n",
+            b->name, b->num_sectors, b->num_sectors / 2048);
+}
+
+int blk_list_all(void *ubuf, int max)
+{
+    int n = blk_count < max ? blk_count : max;
+    for (int i = 0; i < n; i++) {
+        struct blkdev *b = blk_list[i];
+        /* pack: name[16] + sector_size(u32) + num_sectors(u64) = 28 bytes */
+        char tmp[28];
+        memset(tmp, 0, sizeof(tmp));
+        int len = 0;
+        while (b->name[len] && len < 15)
+            tmp[len] = b->name[len], len++;
+        *(u32 *)(tmp + 16) = b->sector_size;
+        *(u64 *)(tmp + 20) = b->num_sectors;
+        if (copy_to_user((char *)ubuf + i * 28, tmp, 28) < 0)
+            return i;
     }
+    return n;
 }
 
 int vfs_try_mount_disk(void)

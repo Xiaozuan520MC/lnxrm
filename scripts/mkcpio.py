@@ -2,7 +2,11 @@
 """Build a cpio 'newc' archive (the format Linux initramfs uses).
 
 Usage: mkcpio.py <output.cpio> spec...
-where each spec is:  path=content-file  or  dir=path
+where each spec is one of:
+    path=content-file      (archive path @ source file)
+    dir=path               (create empty directory)
+    char=path              (create char device node)
+    copy=dst@src           (recursively copy src dir into dst)
 """
 import os
 import sys
@@ -54,6 +58,22 @@ def main():
             return
         blob.extend(cpio_entry(p, 0o0040755 | 0o755, b""))
 
+    def add_file(path, src):
+        with open(src, "rb") as f:
+            data = f.read()
+        p = path.strip("/")
+        parent = os.path.dirname(p)
+        if parent:
+            parts = parent.split("/")
+            acc = []
+            for part in parts:
+                acc.append(part)
+                add_dir("/".join(acc))
+        mode = 0o100755
+        if p.endswith(".txt") or p.endswith("motd"):
+            mode = 0o100644
+        blob.extend(cpio_entry(p, mode, data))
+
     for spec in sys.argv[2:]:
         kind, rest = spec.split("=", 1)
         if kind == "dir":
@@ -70,21 +90,28 @@ def main():
             blob.extend(cpio_entry(p, 0o020600, b""))
         elif kind == "file":
             path, src = rest.split("@", 1)
-            with open(src, "rb") as f:
-                data = f.read()
-            p = path.strip("/")
-            parent = os.path.dirname(p)
-            if parent:
-                # ensure parent dirs exist in archive order
-                parts = parent.split("/")
-                acc = []
-                for part in parts:
-                    acc.append(part)
-                    add_dir("/".join(acc))
-            mode = 0o100755          # regular file, executable
-            if p.endswith(".txt") or p.endswith("motd"):
-                mode = 0o100644
-            blob.extend(cpio_entry(p, mode, data))
+            add_file(path, src)
+        elif kind == "copy":
+            # copy=<archive-dir>@<source-dir>   (recursive)
+            dst, src = rest.split("@", 1)
+            dst = dst.strip("/")
+            src = src.rstrip("/")
+            if not os.path.isdir(src):
+                raise SystemExit(f"copy: source not a directory: {src}")
+            # 先建目标目录本身
+            if dst:
+                add_dir(dst)
+            for root, dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                base = dst if rel == "." else f"{dst}/{rel}"
+                # 当前层的子目录先建，保证父在子前
+                for d in sorted(dirs):
+                    add_dir(f"{base}/{d}")
+                # 当前层的文件
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    p = f"{base}/{fn}" if base else fn
+                    add_file(p, full)
         else:
             raise SystemExit(f"unknown spec {spec}")
 
@@ -100,7 +127,6 @@ def main():
 
     with open(out_path, "wb") as f:
         f.write(bytes(blob))
-    print(f"[mkcpio] {out_path}: {len(blob)} bytes")
 
 if __name__ == "__main__":
     main()

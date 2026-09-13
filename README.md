@@ -11,10 +11,25 @@
 | 进程 | fork/execve/waitpid/exit/nanosleep；基于 PIT 的时间片抢占调度；zombie 停驻 + 栈回收 |
 | 信号 | POSIX 信号机制：SIGTERM/SIGKILL/SIGINT/SIGCHLD/SIGSTOP/SIGCONT；用户态信号 trampoline；信号投递在返回用户态时检查 |
 | 中断 | IDT 全向量、IOAPIC + LAPIC（APIC MMIO 映射）、PIT 100Hz 时钟、PS/2 键盘 + COM1 串口 RX 中断；syscall 内 console_read 临时开中断实现键盘轮询 |
-| 系统调用 | int 0x80 门（DPL3），参数 rdi/rsi/r10，Linux 风格编号（RBX 已纳入帧保存）|
-| 用户态终端 | `/bin/sh`：内建 echo/ls/cat/ps/uname/clear/help，`>` 重定向，fork+execve 运行 /bin/* 程序；支持 BS/DEL 退格 |
+| 系统调用 | int 0x80 门（DPL3），22 个系统调用：read/write/open/close/lseek/brk/getdent/dup2/nanosleep/getpid/fork/execve/exit/wait4/kill/uname/sigaction/sigprocmask/getppid/ps/getcpu/diskinfo |
+| 用户态程序 | 每个命令是独立 ELF 二进制（`/bin/*`），通过 fork+execve 运行 |
 | 文件系统 | VFS 路由层；ramfs（内嵌 cpio initramfs）；**FAT32**（读/写/创建，LFN 读） |
-| 设备 | PCI 枚举（C++ Driver 注册框架）、**AHCI/SATA DMA 磁盘**、PS/2 键盘（VGA 光标同步）、16550 串口（Rust 实现） |
+| 设备 | PCI 枚举（C++ Driver 注册框架）、**IDE PIO 磁盘**（QEMU 原生支持）、**AHCI/SATA DMA 磁盘**、PS/2 键盘（VGA 光标同步）、16550 串口（Rust 实现） |
+
+用户命令
+
+| 命令 | 说明 |
+|---|---|
+| `sh` | 用户态终端，fork/execve 运行命令 |
+| `ls [dir]` | 列出目录，目录带 `/` 后缀 |
+| `cat <file>` | 打印文件内容 |
+| `touch <file>` | 创建空文件 |
+| `echo [args]` | 输出参数 |
+| `ps` | 列出进程 |
+| `kill <pid>` | 发送信号 |
+| `uname` | 系统信息 |
+| `fdisk` | 列出块设备 |
+| `help` | 列出可用命令 |
 
 设计要点
 
@@ -40,6 +55,32 @@
 *键盘输入**：int 0x80 syscall 执行期间 CPU 自动关中断（IF=0），导致 PS/2
   键盘 IRQ1 无法送达；`console_read` 忙等循环中用 `sti; pause; cli` 临时
   开中断，使键盘中断可送达并经 `input_push()` 写入环形缓冲区。
+
+磁盘支持
+
+* **IDE PIO**：内核态 IDE PIO 驱动（0x1F0 端口），支持 QEMU 原生 IDE 磁盘
+* **AHCI/SATA**：AHCI DMA 驱动，支持 SATA 设备
+* **FAT32**：读/写/创建文件，支持长文件名（LFN）
+* **64MB 虚拟磁盘**：QEMU 启动时自动挂载 `build/disk.img` 到 `/mnt`
+
+使用方法
+
+```bash
+# 构建内核
+make
+
+# 构建磁盘镜像（自动创建 64MB FAT32 + README.md）
+make build/disk.img
+
+# 运行 QEMU（自动挂载磁盘）
+make run
+
+# QEMU 内操作
+# ls /           # 查看根目录
+# ls /mnt        # 查看磁盘内容
+# cat /mnt/README.md  # 读取磁盘文件
+# fdisk          # 查看块设备信息
+```
 
 已知限制
 * 磁盘写入标记为实验性。

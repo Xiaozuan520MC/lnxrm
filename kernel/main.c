@@ -67,11 +67,12 @@ void start_kernel(struct boot_params *bp)
         bootinfo.map[bootinfo.map_len].type = src[i].type;
         bootinfo.map_len++;
     }
-
+    
     console_init();
-    kprintf("\nlnxrm v1.0 -- x86_64, built %s %s\n", __DATE__,
-            __TIME__);
-    kprintf("[boot] %d usable e820 entries\n", bootinfo.map_len);
+  /* Show 16 VGA color blocks on screen */
+  vga_show_color_blocks();
+  kprintf("\nlnxrm v1.0 -- x86-64\n");
+  kprintf("[boot] %d usable e820 entries\n", bootinfo.map_len);
 
     /* init per-cpu data for BSP (cpu 0) */
     cpu_init_percpu(0, 0);
@@ -109,11 +110,15 @@ void start_kernel(struct boot_params *bp)
 
     vfs_init();
     vfs_mount_root();
+
+    /* try IDE first (QEMU built-in), then AHCI */
+    extern void ide_init(void);
+    ide_init();
     ahci_init();
     if (vfs_try_mount_disk() == 0)
         kprintf("[vfs] FAT32 disk mounted at /mnt\n");
     else
-        kprintf("\033[1;33m[vfs] no disk found, running from initramfs only\033[0m\n");
+        kprintf("[vfs] no disk found, running from initramfs only\n");
 
     do_global_ctors();
 

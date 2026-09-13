@@ -27,8 +27,6 @@ def main():
 
     with open(path, "wb") as f:
         f.write(bytes(data))
-    print(f"[bzimage] setup_sects={setup_sects} syssize={syssize} "
-          f"payload={payload} bytes, total={total}")
 
 if __name__ == "__main__":
     main()

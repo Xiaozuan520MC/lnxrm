@@ -34,19 +34,25 @@ static inline long sys_call3(long n, long a, long b, long c)
 #define SYS_write 1
 #define SYS_open 2
 #define SYS_close 3
-#define SYS_lseek 8
-#define SYS_getdent 17
-#define SYS_dup2 33
-#define SYS_brk 12
-#define SYS_fork 57
-#define SYS_execve 59
-#define SYS_exit 60
-#define SYS_wait4 61
-#define SYS_getpid 39
-#define SYS_getppid 110
-#define SYS_nanosleep 35
-#define SYS_uname 63
-#define SYS_ps 200
+#define SYS_lseek 4
+#define SYS_brk 5
+#define SYS_getdent 6
+#define SYS_dup2 7
+#define SYS_nanosleep 8
+#define SYS_getpid 9
+#define SYS_fork 10
+#define SYS_execve 11
+#define SYS_exit 12
+#define SYS_wait4 13
+#define SYS_kill 14
+#define SYS_uname 15
+#define SYS_sigaction 16
+#define SYS_sigprocmask 17
+#define SYS_getppid 18
+#define SYS_ps 19
+#define SYS_sigreturn 20
+#define SYS_getcpu 21
+#define SYS_diskinfo 22
 
 static inline long kread(int fd, void *buf, size_t n)
 {
@@ -115,9 +121,31 @@ struct lnxrm_dirent {
     u8 d_type;
     char d_name[56];
 };
+struct lnxrm_sigaction {
+    void (*sa_handler)(int);
+    u64 sa_mask;
+    int sa_flags;
+};
 static inline long kgetdent(int fd, struct lnxrm_dirent *e, size_t len)
 {
     return sys_call3(SYS_getdent, fd, (long)e, len);
+}
+static inline long ksigaction(int sig, const struct lnxrm_sigaction *act,
+                              struct lnxrm_sigaction *oldact)
+{
+    return sys_call3(SYS_sigaction, sig, (long)act, (long)oldact);
+}
+static inline long ksigprocmask(int how, const u64 *set, u64 *oldset)
+{
+    return sys_call3(SYS_sigprocmask, how, (long)set, (long)oldset);
+}
+static inline long kgetcpu(void)
+{
+    return syscall1(SYS_getcpu, 0);
+}
+static inline long kdiskinfo(void *buf, int max)
+{
+    return sys_call3(SYS_diskinfo, (long)buf, max, 0);
 }
 
 /* ---- mini libc ---- */

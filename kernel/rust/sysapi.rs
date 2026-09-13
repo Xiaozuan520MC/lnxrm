@@ -8,15 +8,24 @@ pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
 pub const SYS_OPEN: usize = 2;
 pub const SYS_CLOSE: usize = 3;
-pub const SYS_BRK: usize = 12;
-pub const SYS_NANOSLEEP: usize = 35;
-pub const SYS_GETPID: usize = 39;
-pub const SYS_DUP2: usize = 33;
-pub const SYS_FORK: usize = 57;
-pub const SYS_EXECVE: usize = 59;
-pub const SYS_EXIT: usize = 60;
-pub const SYS_WAIT4: usize = 61;
-pub const SYS_GETPPID: usize = 110;
+pub const SYS_LSEEK: usize = 4;
+pub const SYS_BRK: usize = 5;
+pub const SYS_GETDENT: usize = 6;
+pub const SYS_DUP2: usize = 7;
+pub const SYS_NANOSLEEP: usize = 8;
+pub const SYS_GETPID: usize = 9;
+pub const SYS_FORK: usize = 10;
+pub const SYS_EXECVE: usize = 11;
+pub const SYS_EXIT: usize = 12;
+pub const SYS_WAIT4: usize = 13;
+pub const SYS_KILL: usize = 14;
+pub const SYS_UNAME: usize = 15;
+pub const SYS_SIGACTION: usize = 16;
+pub const SYS_SIGPROCMASK: usize = 17;
+pub const SYS_GETPPID: usize = 18;
+pub const SYS_PS: usize = 19;
+pub const SYS_SIGRETURN: usize = 20;
+pub const SYS_GETCPU: usize = 21;
 
 #[inline]
 unsafe fn syscall1(nr: usize, a: usize) -> isize {

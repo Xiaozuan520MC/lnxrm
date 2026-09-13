@@ -10,7 +10,7 @@ _start:
     lea rsi, [rsp + 8]          ; argv
     call main
     mov rdi, rax                ; exit code
-    mov eax, 60                 ; SYS_exit
+    mov eax, 12                 ; SYS_exit
     int 0x80
 .hang:
     jmp .hang

@@ -20,15 +20,15 @@ int main(int argc, char **argv)
         kdup2(0, 2);
     }
 
-    /* disk smoke test through AHCI+FAT32 */
-    int dfd = kopen("/mnt/README.TXT", 0);
+    /* disk smoke test through IDE+FAT32 */
+    int dfd = kopen("/mnt/README.md", 0);
     if (dfd >= 0) {
         long n = kread(dfd, buf, sizeof(buf));
         if (n > 0)
             kwrite(1, buf, n);
         kclose(dfd);
     } else {
-        xputs("init: no /mnt/README.TXT\n");
+        xputs("init: no /mnt/README.md\n");
     }
 
     /* hand the console to a userspace terminal, forever (like Linux:init) */

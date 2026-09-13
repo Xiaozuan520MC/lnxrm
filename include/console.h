@@ -13,6 +13,8 @@ void console_putc(char c);          /* dual: VGA + COM1 */
 int  console_getc(void);            /* blocking; kbd + serial */
 int  console_trygetc(void);
 
+void vga_show_color_blocks(void);
+
 void panic(const char *fmt, ...) __attribute__((noreturn));
 
 /* string (lib/string.c) */

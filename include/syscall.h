@@ -6,31 +6,30 @@
 extern "C" {
 #endif
 
-/* Linux-flavoured syscall numbers (int 0x80, args in rdi,rsi,rdx,r10,r8) */
+/* Lnxrm syscall numbers (int 0x80, args in rdi,rsi,rdx,r10,r8) */
 #define SYS_read        0
 #define SYS_write       1
 #define SYS_open        2
 #define SYS_close       3
-#define SYS_lseek       8
-#define SYS_getdent     17
-#define SYS_dup2        33
-#define SYS_brk         12
-#define SYS_fork        57
-#define SYS_execve      59
-#define SYS_exit        60
-#define SYS_wait4       61
-#define SYS_getpid      39
-#define SYS_getppid     110
-#define SYS_nanosleep   35
-#define SYS_uname       63
-#define SYS_ps          200
-/* signal syscalls */
-#define SYS_kill        62
-#define SYS_sigaction   64
-#define SYS_sigprocmask 65
-#define SYS_sigreturn   201
-/* SMP syscalls */
-#define SYS_getcpu      202
+#define SYS_lseek       4
+#define SYS_brk         5
+#define SYS_getdent     6
+#define SYS_dup2        7
+#define SYS_nanosleep   8
+#define SYS_getpid      9
+#define SYS_fork        10
+#define SYS_execve      11
+#define SYS_exit        12
+#define SYS_wait4       13
+#define SYS_kill        14
+#define SYS_uname       15
+#define SYS_sigaction   16
+#define SYS_sigprocmask 17
+#define SYS_getppid     18
+#define SYS_ps          19
+#define SYS_sigreturn   20
+#define SYS_getcpu      21
+#define SYS_diskinfo    22
 
 struct lnxrm_utsname {
     char sysname[24];

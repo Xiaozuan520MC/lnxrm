@@ -11,7 +11,7 @@ _signal_trampoline:
     ; signal handler returns here.
     ; The kernel pushed a signal frame on the user stack.
     ; We just need to call sigreturn() to restore the original context.
-    mov rax, 201        ; SYS_sigreturn
+    mov rax, 20         ; SYS_sigreturn
     int 0x80
     ; should not return
 .hang:
