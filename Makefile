@@ -43,7 +43,7 @@ KOBJ_CXX := $(patsubst %.cpp,%.opp,$(KSRC_CXX))
 KOBJ_ASM := $(patsubst %.S,%.o,$(KASM)) $(BUILD)/trampoline.o
 KOBJ     := $(KOBJ_C) $(KOBJ_CXX) $(KOBJ_ASM) $(BUILD)/initramfs.o
 
-.PHONY: all clean run run-only run-q35 test initramfs rust efi
+.PHONY: all clean run
 all: $(BUILD)/bzImage
 
 $(BUILD):
