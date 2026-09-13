@@ -69,17 +69,8 @@
 # 构建内核
 make
 
-# 构建磁盘镜像（自动创建 64MB FAT32 + README.md）
-make build/disk.img
-
 # 运行 QEMU（自动挂载磁盘）
 make run
-
-# QEMU 内操作
-# ls /           # 查看根目录
-# ls /mnt        # 查看磁盘内容
-# cat /mnt/README.md  # 读取磁盘文件
-# fdisk          # 查看块设备信息
 ```
 
 已知限制
