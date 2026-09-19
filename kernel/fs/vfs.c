@@ -1,0 +1,562 @@
+/* Virtual filesystem: path routing between the initramfs ramfs (root) and
+ * an optional FAT32 mount at /mnt, plus the fd table & syscall surface. */
+#include <vfs.h>
+#include <console.h>
+#include <mm.h>
+#include <sched.h>
+#include <io.h>
+#include <syscall.h>
+#include <cpu.h>
+#include <blk_cache.h>
+#include <mbr.h>
+
+/* ---- ramfs backend (fs/ramfs.c) ---- */
+extern struct fs_ops ramfs_ops;
+
+/* ---- fat32 backend (fs/fat32.c) ---- */
+extern struct fs_ops fat32_ops;
+extern void *fat_mount(struct blkdev *b);
+
+/* ---- ext2 backend (fs/ext2.c) ---- */
+extern struct fs_ops ext2_ops;
+extern int ext2_mount(struct blkdev *b);
+
+#define DISK_PREFIX "/mnt"
+#define DISK_PREFIX_LEN 4
+
+/* Mounted filesystem info */
+struct mounted_fs {
+    struct fs_ops *ops;
+    void *priv;
+    char prefix[32];
+    int prefix_len;
+    bool active;
+};
+
+#define MAX_MOUNTS 4
+static struct mounted_fs mounts[MAX_MOUNTS];
+static int mount_count;
+static bool disk_ready;
+void *root_priv;                    /* ramfs private */
+
+long console_read(struct file *f, void *buf, size_t n);
+long console_write(struct file *f, const void *buf, size_t n);
+int  fat_dir_iter(struct dir_iter *it, struct dirent_out *d);
+int  ramfs_getdent(void *mnt, void *dirnode, u64 *cookie, struct dirent_out *d);
+int  ramfs_getdent_raw(struct dir_iter *it, struct dirent_out *d);
+
+int copy_from_user(void *, const void *, size_t);
+int copy_to_user(void *, const void *, size_t);
+bool user_ptr_ok(u64 p, u64 n);
+
+/* ---------------- routing ---------------- */
+static struct fs_ops *route(const char **path)
+{
+    /* Check each mounted filesystem */
+    for (int i = 0; i < mount_count; i++) {
+        if (!mounts[i].active)
+            continue;
+        
+        if (!strncmp(*path, mounts[i].prefix, mounts[i].prefix_len)) {
+            const char *rest = *path + mounts[i].prefix_len;
+            if (*rest == '/' || *rest == '\0') {
+                while (*rest == '/')
+                    rest++;
+                *path = rest;
+                return mounts[i].ops;
+            }
+        }
+        /* Also match without leading '/' (e.g. "mnt" matches "/mnt") */
+        if (mounts[i].prefix[0] == '/' &&
+            !strncmp(*path, mounts[i].prefix + 1, mounts[i].prefix_len - 1)) {
+            const char *rest = *path + mounts[i].prefix_len - 1;
+            if (*rest == '/' || *rest == '\0') {
+                while (*rest == '/')
+                    rest++;
+                *path = rest;
+                return mounts[i].ops;
+            }
+        }
+    }
+    return &ramfs_ops;
+}
+
+static void *route_mnt(void *ops)
+{
+    for (int i = 0; i < mount_count; i++) {
+        if (!mounts[i].active)
+            continue;
+        if (mounts[i].ops == ops)
+            return mounts[i].priv;
+    }
+    return NULL;
+}
+
+/* Register a filesystem mount */
+static int register_mount(struct fs_ops *ops, void *priv, const char *prefix)
+{
+    if (mount_count >= MAX_MOUNTS)
+        return -1;
+    
+    mounts[mount_count].ops = ops;
+    mounts[mount_count].priv = priv;
+    strncpy(mounts[mount_count].prefix, prefix, sizeof(mounts[mount_count].prefix) - 1);
+    mounts[mount_count].prefix[sizeof(mounts[mount_count].prefix) - 1] = 0;
+    mounts[mount_count].prefix_len = strlen(mounts[mount_count].prefix);
+    mounts[mount_count].active = true;
+    mount_count++;
+    
+    return 0;
+}
+
+long vfs_open_file(const char *path, int flags, struct file **out)
+{
+    const char *p = path;
+    struct vnode vn;
+    memset(&vn, 0, sizeof(vn));
+    if (!strcmp(path, "/")) {
+        /* resolve through ramfs so fs_data points at the root rnode */
+        if (ramfs_ops.lookup(NULL, "/", &vn) < 0)
+            return -2;
+        vn.mount = NULL;
+    } else {
+        struct fs_ops *ops = route(&p);
+        void *mnt = route_mnt(ops);
+        /* defensive: a corrupted ops table must not kill the system */
+        extern bool kern_text_ptr(u64 p);
+        if (!kern_text_ptr((u64)ops->lookup))
+            return -2;
+        if (ops->lookup(mnt, p, &vn) < 0) {
+            if (!(flags & O_CREAT))
+                return -2;          /* ENOENT */
+            if (ops->create(mnt, p) < 0)
+                return -13;         /* EACCES-ish */
+            if (ops->lookup(mnt, p, &vn) < 0)
+                return -2;
+            vn.size = 0;
+        } else if ((flags & O_TRUNC) && vn.type == V_REG) {
+            ops->write(mnt, vn.fs_data, 0, NULL, 0);   /* resize to 0 */
+            vn.size = 0;
+        }
+    }
+
+    struct file *f = kmalloc(sizeof(*f));
+    if (!f)
+        return -12;
+    memset(f, 0, sizeof(*f));
+    f->flags = flags;
+    f->refcnt = 1;
+
+    if (vn.type == V_CHR) {
+        extern struct file_ops console_fops;
+        f->ops = &console_fops;
+        f->is_dir = false;
+    } else if (vn.type == V_DIR) {
+        extern struct file_ops dir_fops;
+        f->ops = &dir_fops;
+        f->is_dir = true;
+        /* priv: {node, mount_ops, mount_priv, cookie} packed - matches dir_iter */
+        f->priv = kmalloc(4096);
+        memset(f->priv, 0, 4096);
+        /* Store vnode fs_data (node) */
+        memcpy(f->priv, &vn.fs_data, sizeof(void *));
+        /* Store mount ops pointer (mount) and mount priv (extra) */
+        struct fs_ops *ops = vn.ops;
+        void *mnt_priv = route_mnt(ops);
+        memcpy((char *)f->priv + 8, &ops, sizeof(void *));
+        memcpy((char *)f->priv + 24, &mnt_priv, sizeof(void *));
+    } else {
+        extern struct file_ops reg_fops;
+        f->ops = &reg_fops;
+        f->priv = kmalloc(sizeof(vn));
+        memcpy(f->priv, &vn, sizeof(vn));
+    }
+    *out = f;
+    return 0;
+}
+
+size_t vfs_file_size(struct file *f)
+{
+    struct vnode *vn = f->priv;
+    return f->is_dir ? 0 : vn->size;
+}
+
+long vfs_read_file(struct file *f, void *buf, size_t n)
+{
+    return f->ops->read(f, buf, n);
+}
+
+void vfs_close_file(struct file *f)
+{
+    if (--f->refcnt > 0)
+        return;
+    if (f->ops && f->ops->close)
+        f->ops->close(f);
+    kfree(f);
+}
+
+/* ---------------- fd-level operations ---------------- */
+static struct file *fd_get(int fd)
+{
+    if (fd < 0 || fd >= NR_FDS || !current->fds[fd])
+        return NULL;
+    return current->fds[fd];
+}
+
+long sys_open(const char *path, int flags)
+{
+    struct file *f = NULL;
+    long err = vfs_open_file(path, flags, &f);
+    if (err < 0)
+        return err;
+    for (int i = 0; i < NR_FDS; i++) {
+        if (!current->fds[i]) {
+            current->fds[i] = f;
+            return i;
+        }
+    }
+    vfs_close_file(f);
+    return -24;
+}
+
+long sys_close(int fd)
+{
+    struct file *f = fd_get(fd);
+    if (!f)
+        return -9;
+    current->fds[fd] = NULL;
+    vfs_close_file(f);
+    return 0;
+}
+
+long sys_dup2(int oldfd, int newfd)
+{
+    struct file *f = fd_get(oldfd);
+    if (!f || newfd < 0 || newfd >= NR_FDS)
+        return -9;
+    if (current->fds[newfd])
+        sys_close(newfd);
+    current->fds[newfd] = f;
+    f->refcnt++;
+    return newfd;
+}
+
+long sys_mkdir(const char *path)
+{
+    const char *p = path;
+    struct fs_ops *ops = route(&p);
+    void *mnt = route_mnt(ops);
+    if (!ops->mkdir)
+        return -38;
+    return ops->mkdir(mnt, p);
+}
+
+long sys_read(int fd, void *ubuf, size_t n)
+{
+    struct file *f = fd_get(fd);
+    if (!f)
+        return -9;
+    if (f->is_dir)
+        return -1;
+    static char kbuf[4096];
+    if (n > sizeof(kbuf))
+        n = sizeof(kbuf);
+    long r = f->ops->read(f, kbuf, n);
+    if (r > 0 && copy_to_user(ubuf, kbuf, r) < 0)
+        return -14;
+    return r;
+}
+
+long sys_write(int fd, const void *ubuf, size_t n)
+{
+    struct file *f = fd_get(fd);
+    if (!f)
+        return -9;
+    static char kbuf[4096];
+    if (n > sizeof(kbuf))
+        n = sizeof(kbuf);
+    if (copy_from_user(kbuf, ubuf, n) < 0)
+        return -14;
+    return f->ops->write(f, kbuf, n);
+}
+
+long sys_lseek(int fd, long off, int whence)
+{
+    struct file *f = fd_get(fd);
+    if (!f)
+        return -9;
+    return f->ops->lseek(f, off, whence);
+}
+
+long sys_getdent(int fd, void *ubuf, size_t len)
+{
+    struct file *f = fd_get(fd);
+    if (!f || !f->is_dir)
+        return -9;
+    static char kbuf[1024];
+    if (len > sizeof(kbuf))
+        len = sizeof(kbuf);
+    long r = f->ops->getdent(f, kbuf, len);
+    if (r > 0 && copy_to_user(ubuf, kbuf, r) < 0)
+        return -14;
+    return r;
+}
+
+/* ---------------- generic file/dir fops bridging to fs_ops -------------- */
+
+static long reg_read(struct file *f, void *buf, size_t n)
+{
+    struct vnode *vn = f->priv;
+    long r = vn->ops->read(vn->mount, vn->fs_data, f->pos, buf, n);
+    if (r > 0)
+        f->pos += r;
+    return r;
+}
+
+static long reg_write(struct file *f, const void *buf, size_t n)
+{
+    struct vnode *vn = f->priv;
+    long r = vn->ops->write(vn->mount, vn->fs_data, f->pos, buf, n);
+    if (r > 0)
+        f->pos += r;
+    return r;
+}
+
+static long reg_lseek(struct file *f, long off, int whence)
+{
+    struct vnode *vn = f->priv;
+    u64 base = whence == SEEK_SET ? 0 :
+               whence == SEEK_CUR ? f->pos : vn->size;
+    f->pos = off < 0 ? 0 : base + off;
+    return f->pos;
+}
+
+static long dir_getdent(struct file *f, void *buf, size_t n)
+{
+    struct dir_iter *it = f->priv;
+    struct dirent_out d;
+    long cnt = 0;
+    char *p = buf;
+    while ((size_t)(cnt + (long)sizeof(struct lnxrm_dirent)) <= n) {
+        int (*fn)(void *, void *, u64 *, struct dirent_out *) = NULL;
+        void *mnt = NULL;
+
+        if (it->mount) {
+            fn = ((struct fs_ops *)it->mount)->getdent;
+            mnt = it->extra;
+        }
+
+        if (!fn) {
+            fn = ramfs_getdent;
+        }
+
+        if (fn(mnt, it->node, &it->cookie, &d) < 0)
+            break;
+        struct lnxrm_dirent e;
+        memset(&e, 0, sizeof(e));
+        strncpy(e.d_name, d.name, 55);
+        e.d_type = d.type;
+        memcpy(p + cnt, &e, sizeof(e));
+        cnt += sizeof(e);
+    }
+    return cnt;
+}
+
+int fat_dir_iter(struct dir_iter *it, struct dirent_out *d);
+
+static int noop_close(struct file *f) { return 0; }
+static long noop_read(struct file *f, void *buf, size_t n) { (void)f; (void)buf; (void)n; return -1; }
+static long noop_write(struct file *f, const void *buf, size_t n) { (void)f; (void)buf; (void)n; return -1; }
+
+static int dir_close(struct file *f)
+{
+    kfree(f->priv);
+    return 0;
+}
+
+struct file_ops console_fops = {
+    .read = console_read,
+    .write = console_write,
+    .lseek = NULL,
+    .close = noop_close,
+};
+
+struct file_ops reg_fops = {
+    .read = reg_read,
+    .write = reg_write,
+    .lseek = reg_lseek,
+    .close = noop_close,
+};
+
+struct file_ops dir_fops = {
+    .read = noop_read,
+    .write = noop_write,
+    .getdent = dir_getdent,
+    .close = dir_close,
+};
+
+/* console character device */
+long console_read(struct file *f, void *buf, size_t n)
+{
+    char *p = buf;
+    size_t got = 0;
+    extern int lnxrm_uart_trygetc(void);
+    while (got < n) {
+        int c = input_pop();
+        if (c < 0)
+            c = lnxrm_uart_trygetc();   /* polled fallback */
+        if (c >= 0) {
+            p[got++] = (char)c;
+            if (c == '\n')
+                break;
+        } else {
+            /* We are inside int 0x80 (IF=0). Briefly enable interrupts
+             * so serial/keyboard IRQs can fire and push chars into inbuf.
+             * Then poll the PS/2 controller directly to drain any scancodes
+             * stuck in its output buffer (bypasses IRQ delivery issues). */
+            for (int __w = 0; __w < 256; __w++)
+                __asm__ volatile("sti\n\tpause\n\tcli");
+            kbd_poll();
+        }
+    }
+    return got;
+}
+
+long console_write(struct file *f, const void *buf, size_t n)
+{
+    const char *p = buf;
+    for (size_t i = 0; i < n; i++)
+        console_putc(p[i]);
+    return n;
+}
+
+/* ---------------- boot-time mounting ---------------- */
+void vfs_init(void)
+{
+    extern void ramfs_init(void);
+    ramfs_init();
+    blk_cache_init();
+}
+
+void ramfs_add_from_cpio(const void *cpio, size_t len);
+
+int vfs_mount_root(void)
+{
+    extern u8 __initramfs_start[], __initramfs_end[];
+    ramfs_add_from_cpio(__initramfs_start, __initramfs_end - __initramfs_start);
+    return 0;
+}
+
+struct blkdev *blk_first;
+static struct blkdev *blk_list[8];
+static int blk_count;
+
+void blk_register(struct blkdev *b)
+{
+    if (blk_count < 8)
+        blk_list[blk_count++] = b;
+    if (!blk_first)
+        blk_first = b;
+    kprintf("[blk] registered %s (%llu sectors, %llu MiB)\n",
+            b->name, b->num_sectors, b->num_sectors / 2048);
+}
+
+int blk_list_all(void *ubuf, int max)
+{
+    int n = blk_count < max ? blk_count : max;
+    for (int i = 0; i < n; i++) {
+        struct blkdev *b = blk_list[i];
+        /* pack: name[16] + sector_size(u32) + num_sectors(u64) = 28 bytes */
+        char tmp[28];
+        memset(tmp, 0, sizeof(tmp));
+        int len = 0;
+        while (b->name[len] && len < 15)
+            tmp[len] = b->name[len], len++;
+        *(u32 *)(tmp + 16) = b->sector_size;
+        *(u64 *)(tmp + 20) = b->num_sectors;
+        if (copy_to_user((char *)ubuf + i * 28, tmp, 28) < 0)
+            return i;
+    }
+    return n;
+}
+
+int vfs_try_mount_disk(void)
+{
+    extern struct blkdev *blk_first;
+    if (!blk_first)
+        return -1;
+
+    /* Flush cache before mounting to ensure consistent state */
+    blk_cache_flush(blk_first);
+
+    /* 1. Try whole disk as FAT32 (most common: no MBR partition table) */
+    void *m = fat_mount(blk_first);
+    if (m) {
+        register_mount(&fat32_ops, m, DISK_PREFIX);
+        disk_ready = true;
+        kprintf("[vfs] FAT32 mounted at %s (whole disk)\n", DISK_PREFIX);
+        blk_cache_flush(blk_first);
+        return 0;
+    }
+
+    /* 2. Check for MBR partition table */
+    struct mbr_info mbr;
+    if (mbr_parse(blk_first, &mbr) == 0 && mbr.part_count > 0) {
+        kprintf("[vfs] MBR detected, %d partitions\n", mbr.part_count);
+
+        for (int i = 0; i < mbr.part_count; i++) {
+            if (mbr.parts[i].type == PART_TYPE_NONE)
+                continue;
+
+            kprintf("[vfs] partition %d: type=0x%02X (%s)\n",
+                    i, mbr.parts[i].type, mbr_type_name(mbr.parts[i].type));
+
+            /* Heap-allocate: fat_mount stores dev pointer in fat_priv */
+            struct blkdev *part_dev = kmalloc(sizeof(*part_dev));
+            if (!part_dev)
+                continue;
+
+            if (mbr_get_partition(&mbr, i, part_dev, blk_first) == 0) {
+                void *pm = NULL;
+
+                if (mbr.parts[i].type == PART_TYPE_FAT32 ||
+                    mbr.parts[i].type == PART_TYPE_FAT32_LBA) {
+                    pm = fat_mount(part_dev);
+                } else if (mbr.parts[i].type == PART_TYPE_LINUX) {
+                    if (ext2_mount(part_dev) == 0) {
+                        extern void *ext2_priv;
+                        register_mount(&ext2_ops, ext2_priv, DISK_PREFIX);
+                        disk_ready = true;
+                        kfree(part_dev);
+                        kprintf("[vfs] ext2 mounted at %s\n", DISK_PREFIX);
+                        break;
+                    }
+                }
+
+                if (pm) {
+                    register_mount(&fat32_ops, pm, DISK_PREFIX);
+                    disk_ready = true;
+                    kprintf("[vfs] FAT32 mounted at %s (partition %d)\n", DISK_PREFIX, i);
+                    break;
+                }
+            }
+            kfree(part_dev);
+        }
+
+        if (disk_ready) {
+            blk_cache_flush(blk_first);
+            return 0;
+        }
+    }
+
+    /* 3. Try whole disk as ext2 */
+    if (ext2_mount(blk_first) == 0) {
+        extern void *ext2_priv;
+        register_mount(&ext2_ops, ext2_priv, DISK_PREFIX);
+        disk_ready = true;
+        blk_cache_flush(blk_first);
+        return 0;
+    }
+
+    return -1;
+}
