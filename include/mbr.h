@@ -1,0 +1,64 @@
+#pragma once
+#include <types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* MBR Partition Table Entry */
+struct mbr_entry {
+    u8  status;         /* 0x80 = active/bootable */
+    u8  chs_first[3];   /* CHS of first sector */
+    u8  type;           /* partition type */
+    u8  chs_last[3];    /* CHS of last sector */
+    u32 lba_first;      /* LBA of first sector */
+    u32 sectors_count;  /* number of sectors */
+} __attribute__((packed));
+
+/* MBR Signature */
+#define MBR_SIGNATURE      0xAA55
+#define MBR_PARTITION_TABLE_OFFSET  446
+#define MBR_PARTITION_ENTRY_SIZE    16
+
+/* Partition Types */
+#define PART_TYPE_NONE      0x00
+#define PART_TYPE_FAT12     0x01
+#define PART_TYPE_FAT16_SM  0x04    /* <32MB */
+#define PART_TYPE_EXTENDED  0x05
+#define PART_TYPE_FAT16     0x06
+#define PART_TYPE_FAT32     0x0B
+#define PART_TYPE_FAT32_LBA 0x0C
+#define PART_TYPE_FAT16_LBA 0x0E
+#define PART_TYPE_EXT_LBA  0x0F
+#define PART_TYPE_LINUX     0x83    /* ext2/ext3/ext4 */
+#define PART_TYPE_LINUX_SWAP 0x82
+
+/* Max partitions we track */
+#define MBR_MAX_PARTITIONS  4
+
+struct mbr_info {
+    struct blkdev *dev;
+    u32 total_sectors;
+    u8  boot_ind;       /* active partition index or -1 */
+    struct {
+        u8  type;
+        u32 lba_first;
+        u32 sectors_count;
+        bool is_extended;
+    } parts[MBR_MAX_PARTITIONS];
+    int part_count;
+};
+
+/* Parse MBR from a block device. Returns 0 on success. */
+int mbr_parse(struct blkdev *dev, struct mbr_info *out);
+
+/* Get partition as a virtual block device (for reading partition contents) */
+int mbr_get_partition(struct mbr_info *mbr, int index,
+                      struct blkdev *out_dev, struct blkdev *parent);
+
+/* Get string name for partition type */
+const char *mbr_type_name(u8 type);
+
+#ifdef __cplusplus
+}
+#endif
